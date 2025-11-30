@@ -1,5 +1,5 @@
  #include "mbed.h"
- #include "arm_math.h"  // CMSIS-DSP library
+//  #include "arm_math.h"  // CMSIS-DSP library
 
 
 
@@ -34,7 +34,7 @@ FileHandle *mbed::mbed_override_console(int) {
  #define OUTZ_H_G    0x27  // Gyro Z-axis (high byte)
  
 
-#define BUFFER_SIZE 128  // adjust size depending on RAM
+#define BUFFER_SIZE 64  // adjust size depending on RAM
 #define FS 20.0f        // sampling frequency (Hz)
 
 // Frequency band we care about
@@ -156,6 +156,22 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
     }
     stddev = sqrtf(stddev / N);
 
+     // ---------------------------------------------------------
+    // BUG FIX #1: If stddev too small → no movement, skip FFT
+    // BUG FIX #2: If stddev below threshold → weak movement, ignore
+    // ---------------------------------------------------------
+    const float STDDEV_MIN     = 1.0f;   // absolutely still
+    const float STDDEV_WEAK    = 5.0f;   // noise-level motion
+
+    if (stddev < STDDEV_MIN) {
+        return 0.0f; // no movement at all
+    }
+
+    if (stddev < STDDEV_WEAK) {
+        return 0.0f; // too weak for meaningful oscillation
+    }
+    // ---------------------------------------------------------
+
     // Normalize by standard deviation
     for (size_t i = 0; i < N; i++) {
         buffer[i] /= stddev;
@@ -185,11 +201,15 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
      }
      
     //  // Configure the accelerometer (104 Hz, ±2g range)
-    write_register(CTRL1_XL, 0x40);
+    // write_register(CTRL1_XL, 0x40);
+    write_register(CTRL1_XL, 0x24);  // 0010 0100 → ODR = 26 Hz, ±16g
+
     // printf("Accelerometer configured: 104 Hz, ±2g range\r\n");
 
      // 4. For ±16g range
-    write_register(CTRL1_XL, 0x44);  // 0100 0100: ODR=104Hz, FS=±16g
+    // write_register(CTRL1_XL, 0x44);  // 0100 0100: ODR=104Hz, FS=±16g
+    write_register(CTRL1_XL, 0x24);  // 0010 0100 → ODR = 26 Hz, ±16g
+
     const float ACC_SENSITIVITY = 0.488f;  // mg/LSB
      
      // Configure the gyroscope (104 Hz, ±250 dps range)
@@ -205,11 +225,22 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
      
      // Main loop
      while (1) {
+
+        // --- DEBUG: measure loop timing ---
+        // static uint32_t last = 0;
+        // uint32_t now = Kernel::get_ms_count();
+        // printf("Loop dt = %lu ms\r\n", now - last);
+        // last = now;
+        // -----------------------------------
+
          // Read raw accelerometer values
          int16_t acc_x_raw = read_16bit_value(OUTX_L_XL, OUTX_H_XL);
          int16_t acc_y_raw = read_16bit_value(OUTY_L_XL, OUTY_H_XL);
          int16_t acc_z_raw = read_16bit_value(OUTZ_L_XL, OUTZ_H_XL);
          
+        // --- DEBUG: Print raw Z axis ---
+        // printf("acc_z_raw = %d\r\n", acc_z_raw);
+        // --------------------------------
 
          // take z axis
          acc_z_buffer[idx++] = acc_z_raw;
@@ -218,6 +249,14 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
          // printf("%zu",idx);
          
          if(idx >= BUFFER_SIZE) {
+
+            // --- DEBUG: measure how long it took to collect 128 samples ---
+            // static uint32_t last_buffer_time = 0;
+            // uint32_t now2 = Kernel::get_ms_count();
+            // printf("Buffer filled in %lu ms\r\n", now2 - last_buffer_time);
+            // last_buffer_time = now2;
+            // --------------------------------------------------------------
+
             // 1) Estimate dominant freq for this window
             float freq = estimate_frequency(acc_z_buffer, BUFFER_SIZE);
             // printf("Estimated oscillation frequency: %.2f Hz\r\n", freq);
