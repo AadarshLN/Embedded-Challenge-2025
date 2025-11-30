@@ -35,8 +35,20 @@ FileHandle *mbed::mbed_override_console(int) {
  
 
 #define BUFFER_SIZE 128  // adjust size depending on RAM
-#define FS 5.0f          // sampling frequency (Hz), from 200ms delay
+#define FS 20.0f        // sampling frequency (Hz)
 
+// Frequency band we care about
+#define OSC_MIN_FREQ          2.5f
+#define OSC_MAX_FREQ          5.5f
+
+// How many windows to remember and how strict to be
+#define FREQ_HISTORY_LEN      5       // last 5 windows
+#define MIN_WINDOWS_IN_BAND   3       // at least 3 of them in band
+
+float freq_history[FREQ_HISTORY_LEN];
+bool  in_band_history[FREQ_HISTORY_LEN];
+size_t history_idx    = 0;
+size_t history_count  = 0;   // how many windows we've actually filled so far
 
 
 
@@ -71,6 +83,36 @@ FileHandle *mbed::mbed_override_console(int) {
     for (size_t i = 0; i < N; i++) {
         data[i] *= 0.5f * (1.0f - cosf(2.0f * M_PI * i / (N - 1)));
     }
+}
+
+bool update_and_check_persistent_oscillation(float freq_hz) {
+    // 1) Is this window's dominant freq in the target band?
+    bool in_band = (freq_hz >= OSC_MIN_FREQ && freq_hz <= OSC_MAX_FREQ);
+
+    // 2) Store in circular history
+    freq_history[history_idx]    = freq_hz;
+    in_band_history[history_idx] = in_band;
+
+    history_idx = (history_idx + 1) % FREQ_HISTORY_LEN;
+    if (history_count < FREQ_HISTORY_LEN) {
+        history_count++;
+    }
+
+    // 3) If we don't have enough windows yet, we can't make a strong statement
+    if (history_count < FREQ_HISTORY_LEN) {
+        return false;   // "not yet sure"
+    }
+
+    // 4) Count how many recent windows were in-band
+    size_t in_band_count = 0;
+    for (size_t i = 0; i < history_count; i++) {
+        if (in_band_history[i]) {
+            in_band_count++;
+        }
+    }
+
+    // 5) Persistent oscillation = enough windows in-band
+    return (in_band_count >= MIN_WINDOWS_IN_BAND);
 }
 
 
@@ -129,27 +171,22 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
     return freq;
 }
 
-
-
-
-
-
  int main() {
      // Setup I2C at 400kHz
      i2c.frequency(400000);
      
      // Check if sensor is connected
      uint8_t id = read_register(WHO_AM_I);
-     printf("WHO_AM_I = 0x%02X (Expected: 0x6A)\r\n", id);
+     // printf("WHO_AM_I = 0x%02X (Expected: 0x6A)\r\n", id);
      
      if (id != 0x6A) {
-         printf("Error: LSM6DSL sensor not found!\r\n");
+         // printf("Error: LSM6DSL sensor not found!\r\n");
          while (1) { /* Stop here */ }
      }
      
     //  // Configure the accelerometer (104 Hz, ±2g range)
-    //  write_register(CTRL1_XL, 0x40);
-    //  printf("Accelerometer configured: 104 Hz, ±2g range\r\n");
+    write_register(CTRL1_XL, 0x40);
+    // printf("Accelerometer configured: 104 Hz, ±2g range\r\n");
 
      // 4. For ±16g range
     write_register(CTRL1_XL, 0x44);  // 0100 0100: ODR=104Hz, FS=±16g
@@ -159,7 +196,8 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
      write_register(CTRL2_G, 0x40);
      int16_t acc_z_buffer[BUFFER_SIZE];
      size_t idx = 0;
-     printf("Gyroscope configured: 104 Hz, ±250 dps range\r\n");
+     DigitalOut detect_led(LED1);   // LED shows persistent detection
+     // printf("Gyroscope configured: 104 Hz, ±250 dps range\r\n");
      
      // Conversion factors for ±2g and ±250 dps
     //  const float ACC_SENSITIVITY = 0.061f;  // mg/LSB for ±2g range
@@ -175,20 +213,27 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
 
          // take z axis
          acc_z_buffer[idx++] = acc_z_raw;
-         printf("before if");
+         // printf("before if");
 
-         printf("%zu",idx);
+         // printf("%zu",idx);
          
          if(idx >= BUFFER_SIZE) {
+            // 1) Estimate dominant freq for this window
             float freq = estimate_frequency(acc_z_buffer, BUFFER_SIZE);
-            printf("Estimated oscillation frequency: %.2f Hz\r\n", freq);
+            // printf("Estimated oscillation frequency: %.2f Hz\r\n", freq);
             idx = 0; // reset buffer
+            // 2) Update history & check persistence
+            bool persistent = update_and_check_persistent_oscillation(freq);
+            // 3) Print what’s going on
+            printf("Window freq: %.2f Hz | persistent(2.5–5.5Hz) = %s\r\n",
+               freq,
+               persistent ? "YES" : "NO");
+            // 4) Visual indicator
+            detect_led = persistent ? 1 : 0;
+            // 5) Reset buffer index for next window
+            idx = 0;
         }
         
-
-
-
-
          // Read raw gyroscope values
          int16_t gyro_x_raw = read_16bit_value(OUTX_L_G, OUTX_H_G);
          int16_t gyro_y_raw = read_16bit_value(OUTY_L_G, OUTY_H_G);
@@ -206,16 +251,16 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
          
         //  // Print converted values using printf
         //  printf("Accel [g]: X=%+6.3f, Y=%+6.3f, Z=%+6.3f | Gyro [dps]: X=%+7.2f, Y=%+7.2f, Z=%+7.2f\r\n", 
-        //        acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps);
+        //  acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps);
          
         //  // Output Teleplot format directly with printf
         //  printf(">acc_x:%.3f\n>acc_y:%.3f\n>acc_z:%.3f\n"
-        //         ">gyro_x:%.2f\n>gyro_y:%.2f\n>gyro_z:%.2f\n",
-        //         acc_x_g, acc_y_g, acc_z_g,
-        //         gyro_x_dps, gyro_y_dps, gyro_z_dps);
+        // ">gyro_x:%.2f\n>gyro_y:%.2f\n>gyro_z:%.2f\n",
+        // acc_x_g, acc_y_g, acc_z_g,
+        // gyro_x_dps, gyro_y_dps, gyro_z_dps);
          
          // Wait before next sample
-         ThisThread::sleep_for(200ms);
+         ThisThread::sleep_for(50ms);
      }
  }
  
