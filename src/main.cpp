@@ -1,659 +1,190 @@
- #include "mbed.h"
-//  #include "arm_math.h"  // CMSIS-DSP library
+#include "mbed.h"
+#include "arm_math.h" // CMSIS-DSP library for fast FFT
 
+#define FFT_SIZE        256      // FFT Window Size (Must be power of 2)
+#define SAMPLE_RATE     104.0f   // Sampling Rate in Hz (Requirement is >52Hz)
+#define MA_WINDOW       10       // Moving Average Window Size
 
+#define LSM6DSL_ADDR    (0x6A << 1) // I2C Address shifted for Mbed
+#define WHO_AM_I        0x0F        // Device Identification Register
+#define CTRL1_XL        0x10        // Accelerometer Control Register
+#define CTRL2_G         0x11        // Gyroscope Control Register
+#define CTRL3_C         0x12        // Control Register 3 (Used for BDU)
+#define OUTZ_L_XL       0x2C        // Z-axis Output Low Byte
 
- I2C i2c(PB_11, PB_10);  // I2C2: SDA = PB11, SCL = PB10
- 
+// Initialize I2C on pins PB_11 (SDA) and PB_10 (SCL)
+I2C i2c(PB_11, PB_10);
 
- //ignore this sometimes mac needs this to properly use printf
- // Create serial and bind it to printf
+// Create serial and bind it to printf (Required for Teleplot)
 BufferedSerial serial_port(USBTX, USBRX, 115200);
 FileHandle *mbed::mbed_override_console(int) {
-    return &serial_port;  
+    return &serial_port;
 }
 
- // LSM6DSL address (0x6A in datasheet, shifted left for 8-bit format)
- #define LSM6DSL_ADDR (0x6A << 1)  // Equals 0xD4
+// FFT Buffers
+arm_rfft_fast_instance_f32 S;
+float fft_input[FFT_SIZE];
+float fft_output[FFT_SIZE];
+float fft_mag[FFT_SIZE / 2];
 
- // Please Refer to 48 and 49th pages in LSM6DSL datasheet 
- #define WHO_AM_I    0x0F  // ID register - should return 0x6A
- #define CTRL1_XL    0x10  // Accelerometer control register to configure range
- #define CTRL2_G     0x11  // Gyroscope control register to configure range
- #define OUTX_L_XL   0x28  // XL X-axis (low byte)
- #define OUTX_H_XL   0x29  // XL X-axis (high byte)
- #define OUTY_L_XL   0x2A  // XL Y-axis (low byte)
- #define OUTY_H_XL   0x2B  // XL Y-axis (high byte)
- #define OUTZ_L_XL   0x2C  // XL Z-axis (low byte)
- #define OUTZ_H_XL   0x2D  // XL Z-axis (high byte)
- #define OUTX_L_G    0x22  // Gyro X-axis (low byte)
- #define OUTX_H_G    0x23  // Gyro X-axis (high byte)
- #define OUTY_L_G    0x24  // Gyro Y-axis (low byte)
- #define OUTY_H_G    0x25  // Gyro Y-axis (high byte)
- #define OUTZ_L_G    0x26  // Gyro Z-axis (low byte)
- #define OUTZ_H_G    0x27  // Gyro Z-axis (high byte)
- 
-
-#define BUFFER_SIZE 64  // adjust size depending on RAM
-#define FS 20.0f        // sampling frequency (Hz)
-
-// Frequency band we care about
-#define OSC_MIN_FREQ          2.5f
-#define OSC_MAX_FREQ          5.5f
-
-// How many windows to remember and how strict to be
-#define FREQ_HISTORY_LEN      5       // last 5 windows
-#define MIN_WINDOWS_IN_BAND   3       // at least 3 of them in band
-
-float freq_history[FREQ_HISTORY_LEN];
-bool  in_band_history[FREQ_HISTORY_LEN];
-size_t history_idx    = 0;
-size_t history_count  = 0;   // how many windows we've actually filled so far
+// Moving Average Buffers
+float ma_buffer[MA_WINDOW] = {0};
+int ma_idx = 0;
+float ma_sum = 0.0f;
 
 
-
- // Write a value to a register
- void write_register(uint8_t reg, uint8_t value) {
-     char data[2] = {(char)reg, (char)value};
-     i2c.write(LSM6DSL_ADDR, data, 2);
- }
- 
- // Read a value from a register
- uint8_t read_register(uint8_t reg) {
-     char data = reg;
-     i2c.write(LSM6DSL_ADDR, &data, 1, true); // No stop
-     i2c.read(LSM6DSL_ADDR, &data, 1);
-     return (uint8_t)data;
- }
- 
- // Read a 16-bit value (combines low and high byte registers)
- int16_t read_16bit_value(uint8_t low_reg, uint8_t high_reg) {
-     // Read low byte
-     char low_byte = read_register(low_reg);
-     
-     // Read high byte
-     char high_byte = read_register(high_reg);
-     
-     // Combine the bytes (little-endian: low byte first)
-     return (high_byte << 8) | low_byte;
- }
- 
-
- void apply_hann_window(float *data, size_t N) {
-    for (size_t i = 0; i < N; i++) {
-        data[i] *= 0.5f * (1.0f - cosf(2.0f * M_PI * i / (N - 1)));
-    }
+// Write a byte to a specific register
+void write_reg(uint8_t reg, uint8_t val) {
+    char data[2] = {(char)reg, (char)val};
+    i2c.write(LSM6DSL_ADDR, data, 2);
 }
 
-bool update_and_check_persistent_oscillation(float freq_hz) {
-    // 1) Is this window's dominant freq in the target band?
-    bool in_band = (freq_hz >= OSC_MIN_FREQ && freq_hz <= OSC_MAX_FREQ);
+// Read a single byte (Returns success/fail status)
+bool read_reg(uint8_t reg, uint8_t &val) {
+    char r = (char)reg;
+    // Write register address
+    if (i2c.write(LSM6DSL_ADDR, &r, 1, true) != 0) return false;
+    // Read register value
+    if (i2c.read(LSM6DSL_ADDR, &r, 1) != 0) return false;
+    val = (uint8_t)r;
+    return true;
+}
 
-    // 2) Store in circular history
-    freq_history[history_idx]    = freq_hz;
-    in_band_history[history_idx] = in_band;
+// Read 16-bit integer (Low byte first, then High byte)
+int16_t read_int16(uint8_t reg_low) {
+    uint8_t lo, hi;
+    read_reg(reg_low, lo);
+    read_reg(reg_low + 1, hi);
+    return (int16_t)((hi << 8) | lo);
+}
 
-    history_idx = (history_idx + 1) % FREQ_HISTORY_LEN;
-    if (history_count < FREQ_HISTORY_LEN) {
-        history_count++;
+// Initialize the LSM6DSL sensor
+bool init_sensor() {
+    uint8_t who;
+    
+    // Read WHO_AM_I register and verify it's 0x6A
+    if (!read_reg(WHO_AM_I, who) || who != 0x6A) {
+        printf("Sensor not found! WHO_AM_I = 0x%02X\r\n", who);
+        return false;
     }
 
-    // 3) If we don't have enough windows yet, we can't make a strong statement
-    if (history_count < FREQ_HISTORY_LEN) {
-        return false;   // "not yet sure"
-    }
+    // Configure Block Data Update (BDU)
+    write_reg(CTRL3_C, 0x44); 
 
-    // 4) Count how many recent windows were in-band
-    size_t in_band_count = 0;
-    for (size_t i = 0; i < history_count; i++) {
-        if (in_band_history[i]) {
-            in_band_count++;
+    // Configure Accelerometer: 104 Hz ODR, +/- 8g range, 400Hz Analog Filter
+    // 0x4C = 0100 1100 (ODR=104Hz, FS=8g, BW=400Hz)
+    write_reg(CTRL1_XL, 0x4C); 
+    
+    // Configure Gyroscope (Optional, not used in this specific demo)
+    write_reg(CTRL2_G, 0x00);
+
+    // Wait for sensor to stabilize
+    ThisThread::sleep_for(100ms);
+    return true;
+}
+
+int main() {
+    // Setup I2C at 400kHz (Fast Mode)
+    i2c.frequency(400000);
+
+    // Initialize CMSIS-DSP FFT Library
+    // Generates lookup tables for fast calculation
+    arm_rfft_fast_init_f32(&S, FFT_SIZE);
+
+    // Initialize Sensor with robust checks
+    if (!init_sensor()) {
+        while(1) { 
+            printf("Init Failed.\n"); 
+            ThisThread::sleep_for(1s); 
         }
     }
 
-    // 5) Persistent oscillation = enough windows in-band
-    return (in_band_count >= MIN_WINDOWS_IN_BAND);
-}
+    printf("System Ready. Sample Rate: %.1f Hz\n", SAMPLE_RATE);
 
+    int sample_idx = 0;
+    
+    // Sensitivity for +/- 8g range is 0.244 mg/LSB
+    const float SENSITIVITY = 0.244f; 
 
-size_t fft_find_dominant_freq(float *x, size_t N, float fs, float *freq_out) {
-    // simple DFT
-    float max_mag = 0.0f;
-    size_t dominant_idx = 0;
-    for (size_t k = 0; k < N/2; k++) {
-        float re = 0.0f, im = 0.0f;
-        for (size_t n = 0; n < N; n++) {
-            float angle = 2.0f * M_PI * k * n / N;
-            re += x[n] * cosf(angle);
-            im -= x[n] * sinf(angle);
-        }
-        float mag = sqrtf(re*re + im*im);
-        if (mag > max_mag) {
-            max_mag = mag;
-            dominant_idx = k;
-        }
-    }
-    if (freq_out) {
-        *freq_out = dominant_idx * fs / N;
-    }
-    return dominant_idx;
-}
-
-
-
-float estimate_frequency(int16_t *raw_buffer, size_t N) {
-    float buffer[BUFFER_SIZE];
-
-    // 1. Convert to float and detrend (remove mean)
-    float mean = 0.0f;
-    for (size_t i = 0; i < N; i++) mean += raw_buffer[i];
-    mean /= N;
-
-    float stddev = 0.0f;
-    for (size_t i = 0; i < N; i++) {
-        buffer[i] = (float)raw_buffer[i] - mean;
-        stddev += buffer[i]*buffer[i];
-    }
-    stddev = sqrtf(stddev / N);
-
-     // ---------------------------------------------------------
-    // BUG FIX #1: If stddev too small → no movement, skip FFT
-    // BUG FIX #2: If stddev below threshold → weak movement, ignore
-    // ---------------------------------------------------------
-    const float STDDEV_MIN     = 1.0f;   // absolutely still
-    const float STDDEV_WEAK    = 5.0f;   // noise-level motion
-
-    if (stddev < STDDEV_MIN) {
-        return 0.0f; // no movement at all
-    }
-
-    if (stddev < STDDEV_WEAK) {
-        return 0.0f; // too weak for meaningful oscillation
-    }
-    // ---------------------------------------------------------
-
-    // Normalize by standard deviation
-    for (size_t i = 0; i < N; i++) {
-        buffer[i] /= stddev;
-    }
-
-    // 2. Apply Hann window
-    apply_hann_window(buffer, N);
-
-    // 3. Compute DFT and find dominant frequency
-    float freq = 0.0f;
-    fft_find_dominant_freq(buffer, N, FS, &freq);
-
-    return freq;
-}
-
- int main() {
-     // Setup I2C at 400kHz
-     i2c.frequency(400000);
-     
-     // Check if sensor is connected
-     uint8_t id = read_register(WHO_AM_I);
-     // printf("WHO_AM_I = 0x%02X (Expected: 0x6A)\r\n", id);
-     
-     if (id != 0x6A) {
-         // printf("Error: LSM6DSL sensor not found!\r\n");
-         while (1) { /* Stop here */ }
-     }
-     
-    //  // Configure the accelerometer (104 Hz, ±2g range)
-    // write_register(CTRL1_XL, 0x40);
-    write_register(CTRL1_XL, 0x24);  // 0010 0100 → ODR = 26 Hz, ±16g
-
-    // printf("Accelerometer configured: 104 Hz, ±2g range\r\n");
-
-     // 4. For ±16g range
-    // write_register(CTRL1_XL, 0x44);  // 0100 0100: ODR=104Hz, FS=±16g
-    write_register(CTRL1_XL, 0x24);  // 0010 0100 → ODR = 26 Hz, ±16g
-
-    const float ACC_SENSITIVITY = 0.488f;  // mg/LSB
-     
-     // Configure the gyroscope (104 Hz, ±250 dps range)
-     write_register(CTRL2_G, 0x40);
-     int16_t acc_z_buffer[BUFFER_SIZE];
-     size_t idx = 0;
-     DigitalOut detect_led(LED1);   // LED shows persistent detection
-     // printf("Gyroscope configured: 104 Hz, ±250 dps range\r\n");
-     
-     // Conversion factors for ±2g and ±250 dps
-    //  const float ACC_SENSITIVITY = 0.061f;  // mg/LSB for ±2g range
-     const float GYRO_SENSITIVITY = 8.75f;  // mdps/LSB for ±250 dps range
-     
-     // Main loop
-     while (1) {
-
-        // --- DEBUG: measure loop timing ---
-        // static uint32_t last = 0;
-        // uint32_t now = Kernel::get_ms_count();
-        // printf("Loop dt = %lu ms\r\n", now - last);
-        // last = now;
-        // -----------------------------------
-
-         // Read raw accelerometer values
-         int16_t acc_x_raw = read_16bit_value(OUTX_L_XL, OUTX_H_XL);
-         int16_t acc_y_raw = read_16bit_value(OUTY_L_XL, OUTY_H_XL);
-         int16_t acc_z_raw = read_16bit_value(OUTZ_L_XL, OUTZ_H_XL);
-         
-        // --- DEBUG: Print raw Z axis ---
-        // printf("acc_z_raw = %d\r\n", acc_z_raw);
-        // --------------------------------
-
-         // take z axis
-         acc_z_buffer[idx++] = acc_z_raw;
-         // printf("before if");
-
-         // printf("%zu",idx);
-         
-         if(idx >= BUFFER_SIZE) {
-
-            // --- DEBUG: measure how long it took to collect 128 samples ---
-            // static uint32_t last_buffer_time = 0;
-            // uint32_t now2 = Kernel::get_ms_count();
-            // printf("Buffer filled in %lu ms\r\n", now2 - last_buffer_time);
-            // last_buffer_time = now2;
-            // --------------------------------------------------------------
-
-            // 1) Estimate dominant freq for this window
-            float freq = estimate_frequency(acc_z_buffer, BUFFER_SIZE);
-            // printf("Estimated oscillation frequency: %.2f Hz\r\n", freq);
-            idx = 0; // reset buffer
-            // 2) Update history & check persistence
-            bool persistent = update_and_check_persistent_oscillation(freq);
-            // 3) Print what’s going on
-            printf("Window freq: %.2f Hz | persistent(2.5–5.5Hz) = %s\r\n",
-               freq,
-               persistent ? "YES" : "NO");
-            // 4) Visual indicator
-            detect_led = persistent ? 1 : 0;
-            // 5) Reset buffer index for next window
-            idx = 0;
-        }
+    while (1) {
+        // Data Acquisition ---
+        int16_t raw_val = read_int16(OUTZ_L_XL);
         
-         // Read raw gyroscope values
-         int16_t gyro_x_raw = read_16bit_value(OUTX_L_G, OUTX_H_G);
-         int16_t gyro_y_raw = read_16bit_value(OUTY_L_G, OUTY_H_G);
-         int16_t gyro_z_raw = read_16bit_value(OUTZ_L_G, OUTZ_H_G);
-         
-         // Convert accelerometer values from raw to g
-         float acc_x_g = acc_x_raw * ACC_SENSITIVITY / 100.0f;
-         float acc_y_g = acc_y_raw * ACC_SENSITIVITY / 100.0f;
-         float acc_z_g = acc_z_raw * ACC_SENSITIVITY / 100.0f;
-         
-         // Convert gyroscope values from raw to dps
-         float gyro_x_dps = gyro_x_raw * GYRO_SENSITIVITY / 1000.0f;
-         float gyro_y_dps = gyro_y_raw * GYRO_SENSITIVITY / 1000.0f;
-         float gyro_z_dps = gyro_z_raw * GYRO_SENSITIVITY / 1000.0f;
-         
-        //  // Print converted values using printf
-        //  printf("Accel [g]: X=%+6.3f, Y=%+6.3f, Z=%+6.3f | Gyro [dps]: X=%+7.2f, Y=%+7.2f, Z=%+7.2f\r\n", 
-        //  acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps);
-         
-        //  // Output Teleplot format directly with printf
-        //  printf(">acc_x:%.3f\n>acc_y:%.3f\n>acc_z:%.3f\n"
-        // ">gyro_x:%.2f\n>gyro_y:%.2f\n>gyro_z:%.2f\n",
-        // acc_x_g, acc_y_g, acc_z_g,
-        // gyro_x_dps, gyro_y_dps, gyro_z_dps);
-         
-         // Wait before next sample
-         ThisThread::sleep_for(50ms);
-     }
- }
- 
+        // Convert Raw Int to Gravity (g)
+        float acc_z_g = raw_val * SENSITIVITY / 1000.0f;
 
-/**** Exercise 2 */
+        // This smooths the data for the Teleplot graph but is NOT used for FFT
+        ma_sum -= ma_buffer[ma_idx];
+        ma_buffer[ma_idx] = acc_z_g;
+        ma_sum += ma_buffer[ma_idx];
+        ma_idx = (ma_idx + 1) % MA_WINDOW;
+        float filtered_acc_z = ma_sum / MA_WINDOW;
 
-// // Initialize I2C on pins PB_11 (SDA) and PB_10 (SCL)
-// I2C i2c(PB_11, PB_10);
+  
+        // FFT works best on signals centered at 0.
+        // Z-axis typically measures 1.0g when static, so we subtract 1.0f.
+        float acc_z_centered = acc_z_g - 1.0f;
+        
+        // Fill FFT Input Buffer
+        fft_input[sample_idx] = acc_z_centered;
+        sample_idx++;
 
-// // LSM6DSL I2C address (0x6A shifted left by 1 for Mbed's 8-bit addressing)
-// #define LSM6DSL_ADDR        (0x6A << 1)
-// // Register addresses
-// #define WHO_AM_I            0x0F  // Device identification register
-// #define CTRL1_XL            0x10  // Accelerometer control register
-// #define CTRL2_G             0x11  // Gyroscope control register
-// #define CTRL3_C             0x12  // Common control register
-// #define DRDY_PULSE_CFG      0x0B  // Data-ready pulse configuration
-// #define INT1_CTRL           0x0D  // INT1 pin routing control
-// #define STATUS_REG          0x1E  // Status register (data ready flags)
-// #define OUTX_L_G            0x22  // Gyroscope X-axis low byte start address
-// #define OUTX_L_XL           0x28  // Accelerometer X-axis low byte start address
+        if (sample_idx >= FFT_SIZE) {
+            
+            // xecute FFT (Real -> Complex)
+            arm_rfft_fast_f32(&S, fft_input, fft_output, 0);
+            
+            // Compute Magnitude (Complex -> Real)
+            arm_cmplx_mag_f32(fft_output, fft_mag, FFT_SIZE / 2);
 
-// // INT1 interrupt pin connected to PD_11
-// #define LSM6DSL_INT1_PIN    PD_11
+            // Find Dominant Frequency (High-Pass Filtered)
+            float max_val = 0.0f;
+            int max_idx = 0;
+            
+            // Start search from index 7 (approx 2.8Hz)
+            // This ignores low-frequency movements like walking or waving arms (typically < 2Hz)
+            for (int i = 7; i < FFT_SIZE / 2; i++) {
+                if (fft_mag[i] > max_val) {
+                    max_val = fft_mag[i];
+                    max_idx = i;
+                }
+            }
 
-// // Configure INT1 as interrupt input with pull-down resistor
-// InterruptIn int1(LSM6DSL_INT1_PIN, PullDown);
-// // Flag set by interrupt when new data is ready
-// volatile bool data_ready = false;
-
-// // Interrupt service routine - sets flag when data is ready
-// void data_ready_isr() { 
-//     data_ready = true; 
-// }
-
-// // Write a single byte to a register
-// bool write_reg(uint8_t reg, uint8_t val) {
-//     // Create buffer with register address and value
-//     char buf[2] = {(char)reg, (char)val};
-//     // Write to I2C and return success status
-//     return (i2c.write(LSM6DSL_ADDR, buf, 2) == 0);
-// }
-
-// // Read a single byte from a register
-// bool read_reg(uint8_t reg, uint8_t &val) {
-//     // Store register address to read from
-//     char r = (char)reg;
-//     // Write register address with repeated start condition
-//     if (i2c.write(LSM6DSL_ADDR, &r, 1, true) != 0) return false;
-//     // Read the register value
-//     if (i2c.read(LSM6DSL_ADDR, &r, 1) != 0) return false;
-//     // Store result in output parameter
-//     val = (uint8_t)r;
-//     return true;
-// }
-
-// // Read 16-bit signed integer from two consecutive registers
-// bool read_int16(uint8_t reg_low, int16_t &val) {
-//     uint8_t lo, hi;
-//     // Read low byte
-//     if (!read_reg(reg_low, lo)) return false;
-//     // Read high byte from next register
-//     if (!read_reg(reg_low + 1, hi)) return false;
-//     // Combine bytes into 16-bit value (little-endian)
-//     val = (int16_t)((hi << 8) | lo);
-//     return true;
-// }
-
-// // Initialize the LSM6DSL sensor
-// bool init_sensor() {
-//     uint8_t who;
-//     // Read WHO_AM_I register and verify it's 0x6A
-//     if (!read_reg(WHO_AM_I, who) || who != 0x6A) {
-//         printf("Sensor not found!\r\n");
-//         return false;
-//     }
-    
-//     // Configure CTRL3_C: Block data update + auto-increment address
-//     write_reg(CTRL3_C, 0x44);
-//     // Configure accelerometer: 104 Hz, ±16g range
-//     write_reg(CTRL1_XL, 0x54);
-//     // Configure gyroscope: 104 Hz, ±250 dps range
-//     write_reg(CTRL2_G, 0x50);
-//     // Route data-ready signal to INT1 pin
-//     write_reg(INT1_CTRL, 0x03);
-//     // Enable pulsed data-ready mode (50μs pulses)
-//     write_reg(DRDY_PULSE_CFG, 0x80);
-    
-//     // Wait for sensor to stabilize
-//     ThisThread::sleep_for(100ms);
-    
-//     // Clear status register
-//     uint8_t dummy;
-//     read_reg(STATUS_REG, dummy);
-//     // Clear old data by reading all output registers
-//     int16_t temp;
-//     for (int i = 0; i < 6; i++) {
-//         read_int16(OUTX_L_XL + i*2, temp);
-//     }
-    
-//     // Attach interrupt handler for rising edge on INT1
-//     int1.rise(&data_ready_isr);
-    
-//     return true;
-// }
-
-// // Read and print sensor data
-// void read_sensor_data() {
-//     // Arrays to store raw 16-bit values
-//     int16_t acc[3], gyro[3];
-    
-//     // Read all 3 axes for accelerometer and gyroscope
-//     for (int i = 0; i < 3; i++) {
-//         read_int16(OUTX_L_XL + i*2, acc[i]);
-//         read_int16(OUTX_L_G + i*2, gyro[i]);
-//     }
-    
-//     // Convert accelerometer raw values to g (±16g range: 0.488 mg/LSB)
-//     float ax = acc[0] * 0.000488f;
-//     float ay = acc[1] * 0.000488f;
-//     float az = acc[2] * 0.000488f;
-    
-//     // Convert gyroscope raw values to dps (±250 dps range: 8.75 mdps/LSB)
-//     float gx = gyro[0] * 0.00875f;
-//     float gy = gyro[1] * 0.00875f;
-//     float gz = gyro[2] * 0.00875f;
-    
-//     // Print in Teleplot format (>name:value)
-//     printf(">acc_x:%.3f\n>acc_y:%.3f\n>acc_z:%.3f\n>gyro_x:%.2f\n>gyro_y:%.2f\n>gyro_z:%.2f\n", ax, ay, az, gx, gy, gz);
-// }
-
-// int main() {
-
-//     static BufferedSerial pc(USBTX, USBRX, 115200);
-
-//     // Set I2C clock speed to 400 kHz (fast mode)
-//     i2c.frequency(400000);
-//     // printf("\r\n=== LSM6DSL IMU Demo ===\r\n\r\n");
-    
-//     // Initialize sensor and halt if it fails
-//     if (!init_sensor()) {
-//         while(1) { ThisThread::sleep_for(1s); }
-//     }
-    
-//     // printf("Sensor initialized. Streaming to Teleplot at 104 Hz...\r\n\r\n");
-    
-//     // Main loop: wait for interrupt and read data
-//     while (true) {
-//         // Check if new data is ready
-//         if (data_ready) {
-//             // Clear flag
-//             data_ready = false;
-//             // Read and print sensor data
-//             read_sensor_data();
-//         }
-//         // Short sleep to prevent busy-waiting
-//         ThisThread::sleep_for(1ms);
-//     }
-// }
+            // Convert bin index to Frequency (Hz)
+            float freq = (float)max_idx * SAMPLE_RATE / FFT_SIZE;
 
 
+            // Since we converted to 'g', the magnitude values are smaller than raw data.
+            // Adjust this threshold if you see non-zero frequency when static.
+            #define MAG_THRESHOLD 1.2f 
 
-/**** Exercise 3 */
+            if (max_val < MAG_THRESHOLD) {
+                freq = 0.0f; // Force frequency to 0 if signal is too weak
+            }
 
+            // Classification Logic
+            const char* status = "Normal";
+            if (freq > 0.0f) {
+                // Tremor: 3 - 5 Hz 
+                if (freq >= 2.8f && freq <= 5.2f) {
+                    status = "TREMOR";
+                } 
+                // Dyskinesia: 5 - 7 Hz 
+                // Expanded range slightly to 8.0Hz to capture fast movements easier
+                else if (freq > 5.2f && freq <= 8.2f) {
+                    status = "DYSKINESIA";
+                }
+            }
 
-// #include <cstdio>
-// #include "mbed.h"
+            // Output
+            printf("Freq_Hz:%.2f  Mag:%.2f  Status:%s\n", freq, max_val, status);
 
-// // Initialize I2C on pins PB_11 (SDA) and PB_10 (SCL)
-// I2C i2c(PB_11, PB_10);
+            // Reset buffer index
+            sample_idx = 0; 
+        }
 
-// // LSM6DSL I2C address (0x6A shifted left by 1 for Mbed's 8-bit addressing)
-// #define LSM6DSL_ADDR        (0x6A << 1)
-// // Register addresses
-// #define WHO_AM_I            0x0F  // Device identification register
-// #define CTRL1_XL            0x10  // Accelerometer control register
-// #define CTRL2_G             0x11  // Gyroscope control register
-// #define CTRL3_C             0x12  // Common control register
-// #define DRDY_PULSE_CFG      0x0B  // Data-ready pulse configuration
-// #define INT1_CTRL           0x0D  // INT1 pin routing control
-// #define STATUS_REG          0x1E  // Status register (data ready flags)
-// #define OUTX_L_G            0x22  // Gyroscope X-axis low byte start address
-// #define OUTX_L_XL           0x28  // Accelerometer X-axis low byte start address
-
-// // INT1 interrupt pin connected to PD_11
-// #define LSM6DSL_INT1_PIN    PD_11
-
-// // Structure to hold one IMU sample
-// typedef struct {
-//     float acc[3];
-//     float gyro[3];
-// } ImuSample;
-
-// // Event queue for print task
-// EventQueue print_queue;
-
-// // Configure INT1 as interrupt input with pull-down resistor
-// InterruptIn int1(LSM6DSL_INT1_PIN, PullDown);
-// // Flag set by interrupt when new data is ready
-// volatile bool data_ready = false;
-
-// // Interrupt service routine - sets flag when data is ready
-// void data_ready_isr() { 
-//     data_ready = true; 
-// }
-
-// // Write a single byte to a register
-// bool write_reg(uint8_t reg, uint8_t val) {
-//     // Create buffer with register address and value
-//     char buf[2] = {(char)reg, (char)val};
-//     // Write to I2C and return success status
-//     return (i2c.write(LSM6DSL_ADDR, buf, 2) == 0);
-// }
-
-// // Read a single byte from a register
-// bool read_reg(uint8_t reg, uint8_t &val) {
-//     // Store register address to read from
-//     char r = (char)reg;
-//     // Write register address with repeated start condition
-//     if (i2c.write(LSM6DSL_ADDR, &r, 1, true) != 0) return false;
-//     // Read the register value
-//     if (i2c.read(LSM6DSL_ADDR, &r, 1) != 0) return false;
-//     // Store result in output parameter
-//     val = (uint8_t)r;
-//     return true;
-// }
-
-// // Read 16-bit signed integer from two consecutive registers
-// bool read_int16(uint8_t reg_low, int16_t &val) {
-//     uint8_t lo, hi;
-//     // Read low byte
-//     if (!read_reg(reg_low, lo)) return false;
-//     // Read high byte from next register
-//     if (!read_reg(reg_low + 1, hi)) return false;
-//     // Combine bytes into 16-bit value (little-endian)
-//     val = (int16_t)((hi << 8) | lo);
-//     return true;
-// }
-
-// // Initialize the LSM6DSL sensor
-// bool init_sensor() {
-//     uint8_t who;
-//     // Read WHO_AM_I register and verify it's 0x6A
-//     if (!read_reg(WHO_AM_I, who) || who != 0x6A) {
-//         printf("Sensor not found!\r\n");
-//         return false;
-//     }
-    
-//     // Configure CTRL3_C: Block data update + auto-increment address
-//     write_reg(CTRL3_C, 0x44);
-//     // Configure accelerometer: 104 Hz, ±16g range
-//     write_reg(CTRL1_XL, 0x54);
-//     // Configure gyroscope: 104 Hz, ±250 dps range
-//     write_reg(CTRL2_G, 0x50);
-//     // Route data-ready signal to INT1 pin
-//     write_reg(INT1_CTRL, 0x03);
-//     // Enable pulsed data-ready mode (50μs pulses)
-//     write_reg(DRDY_PULSE_CFG, 0x80);
-    
-//     // Wait for sensor to stabilize
-//     ThisThread::sleep_for(100ms);
-    
-//     // Clear status register
-//     uint8_t dummy;
-//     read_reg(STATUS_REG, dummy);
-//     // Clear old data by reading all output registers
-//     int16_t temp;
-//     for (int i = 0; i < 6; i++) {
-//         read_int16(OUTX_L_XL + i*2, temp);
-//     }
-    
-//     // Attach interrupt handler for rising edge on INT1
-//     int1.rise(&data_ready_isr);
-    
-//     return true;
-// }
-
-// // Print function - called by event queue
-// void print_sample(ImuSample sample) {
-//     // Print in Teleplot format (>name:value)
-//     printf(">acc_x:%.3f\n>acc_y:%.3f\n>acc_z:%.3f\n>gyro_x:%.2f\n>gyro_y:%.2f\n>gyro_z:%.2f\n",
-//            sample.acc[0], sample.acc[1], sample.acc[2],
-//            sample.gyro[0], sample.gyro[1], sample.gyro[2]);
-// }
-
-// // Read sensor data and post to event queue
-// void read_sensor_data() {
-//     // Arrays to store raw 16-bit values
-//     int16_t acc[3], gyro[3];
-    
-//     // Read all 3 axes for accelerometer and gyroscope
-//     for (int i = 0; i < 3; i++) {
-//         read_int16(OUTX_L_XL + i*2, acc[i]);
-//         read_int16(OUTX_L_G + i*2, gyro[i]);
-//     }
-    
-//     // Create sample struct
-//     ImuSample sample;
-//     // Convert accelerometer raw values to g (±16g range: 0.488 mg/LSB)
-//     sample.acc[0] = acc[0] * 0.000488f;
-//     sample.acc[1] = acc[1] * 0.000488f;
-//     sample.acc[2] = acc[2] * 0.000488f;
-    
-//     // Convert gyroscope raw values to dps (±250 dps range: 8.75 mdps/LSB)
-//     sample.gyro[0] = gyro[0] * 0.00875f;
-//     sample.gyro[1] = gyro[1] * 0.00875f;
-//     sample.gyro[2] = gyro[2] * 0.00875f;
-    
-//     // Post print event to queue with struct
-//     print_queue.call(print_sample, sample);
-// }
-
-// // Acquisition task - reads sensor when data is ready
-// void acquisition_task() {
-//     while (true) {
-//         // Check if new data is ready
-//         if (data_ready) {
-//             // Clear flag
-//             data_ready = false;
-//             // Read and queue sensor data
-//             read_sensor_data();
-//         }
-//         // Short sleep to prevent busy-waiting
-//         ThisThread::sleep_for(1ms);
-//     }
-// }
-
-// // Print task - dispatches event queue
-// void print_task() {
-//     print_queue.dispatch_forever();
-// }
-
-// int main() {
-//     // Configure serial port
-//     static BufferedSerial pc(USBTX, USBRX, 115200);
-
-//     // Set I2C clock speed to 400 kHz (fast mode)
-//     i2c.frequency(400000);
-    
-//     // Initialize sensor and halt if it fails
-//     if (!init_sensor()) {
-//         while(1) { ThisThread::sleep_for(1s); }
-//     }
-    
-//     // Create acquisition thread
-//     Thread acq_thread;
-//     acq_thread.start(acquisition_task);
-    
-//     // Create print thread
-//     Thread print_thread;
-//     print_thread.start(print_task);
-    
-//     // Main thread does nothing, other threads handle everything
-//     while (true) {
-//         ThisThread::sleep_for(1s);
-//     }
-// }
+        // Sampling Delay
+        // 104 Hz = approx 9.6ms period
+        ThisThread::sleep_for(9ms);
+    }
+}
