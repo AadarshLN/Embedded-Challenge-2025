@@ -10,7 +10,7 @@
 #define CTRL1_XL        0x10        // Accelerometer Control Register
 #define CTRL2_G         0x11        // Gyroscope Control Register
 #define CTRL3_C         0x12        // Control Register 3 (Used for BDU)
-#define OUTZ_L_XL       0x2C        // Z-axis Output Low Byte
+#define OUTX_L_XL       0x28
 
 // Initialize I2C on pins PB_11 (SDA) and PB_10 (SCL)
 I2C i2c(PB_11, PB_10);
@@ -37,6 +37,18 @@ float ma_sum = 0.0f;
 void write_reg(uint8_t reg, uint8_t val) {
     char data[2] = {(char)reg, (char)val};
     i2c.write(LSM6DSL_ADDR, data, 2);
+}
+
+void read_all_axes(int16_t *x, int16_t *y, int16_t *z) {
+    char reg = OUTX_L_XL;
+    char data[6]; // X_L, X_H, Y_L, Y_H, Z_L, Z_H
+    
+    i2c.write(LSM6DSL_ADDR, &reg, 1, true);
+    i2c.read(LSM6DSL_ADDR, data, 6);
+    
+    *x = (int16_t)((data[1] << 8) | data[0]);
+    *y = (int16_t)((data[3] << 8) | data[2]);
+    *z = (int16_t)((data[5] << 8) | data[4]);
 }
 
 // Read a single byte (Returns success/fail status)
@@ -108,29 +120,41 @@ int main() {
 
     while (1) {
         // Data Acquisition ---
-        int16_t raw_val = read_int16(OUTZ_L_XL);
+        int16_t rx, ry, rz;
+        read_all_axes(&rx, &ry, &rz);
         
-        // Convert Raw Int to Gravity (g)
-        float acc_z_g = raw_val * SENSITIVITY / 1000.0f;
+        // Convert to Gravity (g)
+        float ax = rx * SENSITIVITY / 1000.0f;
+        float ay = ry * SENSITIVITY / 1000.0f;
+        float az = rz * SENSITIVITY / 1000.0f;
 
-        // This smooths the data for the Teleplot graph but is NOT used for FFT
-        ma_sum -= ma_buffer[ma_idx];
-        ma_buffer[ma_idx] = acc_z_g;
-        ma_sum += ma_buffer[ma_idx];
-        ma_idx = (ma_idx + 1) % MA_WINDOW;
-        float filtered_acc_z = ma_sum / MA_WINDOW;
+        // // This smooths the data for the Teleplot graph but is NOT used for FFT
+        // ma_sum -= ma_buffer[ma_idx];
+        // ma_buffer[ma_idx] = acc_z_g;
+        // ma_sum += ma_buffer[ma_idx];
+        // ma_idx = (ma_idx + 1) % MA_WINDOW;
+        // float filtered_acc_z = ma_sum / MA_WINDOW;
+
+        float norm = sqrtf(ax*ax + ay*ay + az*az);
 
   
         // FFT works best on signals centered at 0.
         // Z-axis typically measures 1.0g when static, so we subtract 1.0f.
-        float acc_z_centered = acc_z_g - 1.0f;
+        float acc_centered = norm - 1.0f;
         
         // Fill FFT Input Buffer
-        fft_input[sample_idx] = acc_z_centered;
+        fft_input[sample_idx] = acc_centered;
         sample_idx++;
 
         if (sample_idx >= FFT_SIZE) {
             
+            // Hann window
+            for (int i = 0; i < FFT_SIZE; i++) {
+                float hann = 0.5f * (1.0f - arm_cos_f32(2.0f * PI * i / (FFT_SIZE - 1)));
+                fft_input[i] *= hann;
+            }
+
+
             // xecute FFT (Real -> Complex)
             arm_rfft_fast_f32(&S, fft_input, fft_output, 0);
             
@@ -143,7 +167,7 @@ int main() {
             
             // Start search from index 7 (approx 2.8Hz)
             // This ignores low-frequency movements like walking or waving arms (typically < 2Hz)
-            for (int i = 7; i < FFT_SIZE / 2; i++) {
+            for (int i = 1; i < FFT_SIZE / 2; i++) {
                 if (fft_mag[i] > max_val) {
                     max_val = fft_mag[i];
                     max_idx = i;
@@ -177,7 +201,9 @@ int main() {
             }
 
             // Output
-            printf("Freq_Hz:%.2f  Mag:%.2f  Status:%s\n", freq, max_val, status);
+            // printf("Freq_Hz:%.2f  Mag:%.2f  Status:%s\n", freq, max_val, status);
+            printf(">X:%.2f >Y:%.2f >Z:%.2f >Freq_Hz:%.2f >Mag:%.2f >Status:%s\n", 
+                   ax, ay, az, freq, max_val, status);
 
             // Reset buffer index
             sample_idx = 0; 
