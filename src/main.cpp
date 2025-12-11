@@ -45,6 +45,15 @@ FileHandle *mbed::mbed_override_console(int) {
 #define FREQ_HISTORY_LEN      5       // last 5 windows
 #define MIN_WINDOWS_IN_BAND   3       // at least 3 of them in band
 
+#define MOVE_FREQ_MIN_HZ          1.0f   // "definitely moving" (step freq is usually ~1–2 Hz)
+#define STILL_FREQ_MAX_HZ         0.35f  // treat below this as ~0 Hz
+#define FOG_PREV_MOVE_WINDOWS     2      // need at least 2 recent moving windows
+#define FOG_STILL_WINDOWS         1      // and 1 still windows to call FOG
+
+
+
+
+
 float freq_history[FREQ_HISTORY_LEN];
 bool  in_band_history[FREQ_HISTORY_LEN];
 size_t history_idx    = 0;
@@ -175,6 +184,47 @@ bool update_and_check_persistent_dysk(float freq_hz) {
 
 
 
+bool update_and_check_fog(float freq_hz)
+{
+    // Track how many recent windows were clearly moving vs clearly still
+    static size_t recent_move_windows  = 0;
+    static size_t recent_still_windows = 0;
+
+    bool moving = (freq_hz >= MOVE_FREQ_MIN_HZ);
+    bool still  = (freq_hz <= STILL_FREQ_MAX_HZ);  // freq==0 falls in here
+
+    if (moving) {
+        // We’re definitely moving in this window.
+        if (recent_move_windows < FOG_PREV_MOVE_WINDOWS) {
+            recent_move_windows++;
+        }
+        // movement breaks the "still" streak
+        recent_still_windows = 0;
+    }
+    else if (still) {
+        // We’re clearly still; only counts toward FOG if we had movement before.
+        if (recent_move_windows >= FOG_PREV_MOVE_WINDOWS &&
+            recent_still_windows < FOG_STILL_WINDOWS) {
+            recent_still_windows++;
+        }
+    }
+    else {
+        // In-between frequency: neither clearly moving nor still.
+        recent_still_windows = 0;
+    }
+
+    bool fog_detected =
+        (recent_move_windows >= FOG_PREV_MOVE_WINDOWS) &&
+        (recent_still_windows >= FOG_STILL_WINDOWS);
+
+    if (fog_detected) {
+        // Reset so you can detect another FOG event later.
+        recent_move_windows  = 0;
+        recent_still_windows = 0;
+    }
+
+    return fog_detected;
+}
 
 
 
@@ -252,19 +302,19 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
     return freq;
 }
 
-int16_t* magnitude(int16_t* v1, int16_t* v2, int16_t* v3) {
-    int16_t mag_buffer[BUFFER_SIZE];
-    for(int16_t i = 0  ; i < BUFFER_SIZE ; i++) {
-        //printf("x: v1[i] = %d, v2[i] = %d, v3[i] = %d\n", v1[i], v2[i], v3[i]);
-        mag_buffer[i] = sqrtf(
-            v1[i]*v1[i] +
-            v2[i]*v2[i] +
-            v3[i]*v3[i]
-        );
-    }
+// int16_t* magnitude(int16_t* v1, int16_t* v2, int16_t* v3) {
+//     int16_t mag_buffer[BUFFER_SIZE];
+//     for(int16_t i = 0  ; i < BUFFER_SIZE ; i++) {
+//         //printf("x: v1[i] = %d, v2[i] = %d, v3[i] = %d\n", v1[i], v2[i], v3[i]);
+//         mag_buffer[i] = sqrtf(
+//             v1[i]*v1[i] +
+//             v2[i]*v2[i] +
+//             v3[i]*v3[i]
+//         );
+//     }
 
-    return mag_buffer;
-}
+//     return mag_buffer;
+// }
 
  int main() {
      // Setup I2C at 400kHz
@@ -341,21 +391,21 @@ int16_t* magnitude(int16_t* v1, int16_t* v2, int16_t* v3) {
             // printf("Buffer filled in %lu ms\r\n", now2 - last_buffer_time);
             // last_buffer_time = now2;
             // --------------------------------------------------------------
-            int16_t* acc_magnitude_buffer = magnitude(
-                acc_x_buffer,
-                acc_y_buffer,
-                acc_z_buffer
-            );
+            // int16_t* acc_magnitude_buffer = magnitude(
+            //     acc_x_buffer,
+            //     acc_y_buffer,
+            //     acc_z_buffer
+            // );
             // 1) Estimate dominant freq for this window
             // float freq = estimate_frequency(acc_z_buffer, BUFFER_SIZE);
             // float fx = estimate_frequency(acc_x_buffer, BUFFER_SIZE);
             // float fy = estimate_frequency(acc_y_buffer, BUFFER_SIZE);
              float fz = estimate_frequency(acc_z_buffer, BUFFER_SIZE);
             // float freq_magnitude = magnitude(fx, fy, fz);
-            float freq_magnitude = estimate_frequency(
-                acc_magnitude_buffer,
-                BUFFER_SIZE
-            );
+            // float freq_magnitude = estimate_frequency(
+            //     acc_magnitude_buffer,
+            //     BUFFER_SIZE
+            // );
 
 
             // bool in_x = (fx >= DYSK_MIN_FREQ && fx <= DYSK_MAX_FREQ);
@@ -403,6 +453,23 @@ int16_t* magnitude(int16_t* v1, int16_t* v2, int16_t* v3) {
             // detect_led = persistent ? 1 : 0;
             // // 5) Reset buffer index for next window
             idx = 0;
+
+
+            bool fog_detected = update_and_check_fog(fz);
+            printf("FOG Detection check:\n");
+            printf("\nWindow freq: %.2f Hz | Dyskinesia=%s | Tremor=%s | FOG=%s\r\n",
+       fz,
+       persistent_dys ? "YES" : "NO",
+       persistent_tremor ? "YES" : "NO",
+       fog_detected ? "YES" : "NO");
+
+
+
+
+
+
+
+
         }
         
         //  // Read raw gyroscope values
