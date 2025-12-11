@@ -123,25 +123,55 @@ bool update_and_check_persistent_oscillation(float freq_hz) {
 }
 
 
-bool update_and_check_persistent_dysk(bool in_band, float combined_freq_for_logging) {
-    dysk_freq_history[dysk_history_idx]    = combined_freq_for_logging;
-    dysk_in_band_history[dysk_history_idx] = in_band;
+// bool update_and_check_persistent_dysk(bool in_band, float combined_freq_for_logging) {
+//     dysk_freq_history[dysk_history_idx]    = combined_freq_for_logging;
+//     dysk_in_band_history[dysk_history_idx] = in_band;
 
-    dysk_history_idx = (dysk_history_idx + 1) % FREQ_HISTORY_LEN;
-    if (dysk_history_count < FREQ_HISTORY_LEN) dysk_history_count++;
+//     dysk_history_idx = (dysk_history_idx + 1) % FREQ_HISTORY_LEN;
+//     if (dysk_history_count < FREQ_HISTORY_LEN) dysk_history_count++;
 
-    if (dysk_history_count < FREQ_HISTORY_LEN) return false;
+//     if (dysk_history_count < FREQ_HISTORY_LEN) return false;
 
-    size_t in_count = 0;
-    for (size_t i = 0; i < dysk_history_count; i++) {
-        if (dysk_in_band_history[i]) in_count++;
-    }
-    return (in_count >= MIN_WINDOWS_IN_BAND);
-}
+//     size_t in_count = 0;
+//     for (size_t i = 0; i < dysk_history_count; i++) {
+//         if (dysk_in_band_history[i]) in_count++;
+//     }
+//     return (in_count >= MIN_WINDOWS_IN_BAND);
+// }
 // Update history based on a single magnitude-derived frequency for the window.
 // mag_freq: scalar frequency computed from the magnitude (or 0.0 if no/weak motion).
 // Returns true when persistent dyskinesia is detected (>= MIN_WINDOWS_IN_BAND in last FREQ_HISTORY_LEN windows).
 
+bool update_and_check_persistent_dysk(float freq_hz) {
+    // 1) Is this window's dominant freq in the target band?
+    bool in_band = (freq_hz >= DYSK_MIN_FREQ && freq_hz <= DYSK_MAX_FREQ);
+
+    // 2) Store in circular history
+    freq_history[history_idx]    = freq_hz;
+    in_band_history[history_idx] = in_band;
+
+    history_idx = (history_idx + 1) % FREQ_HISTORY_LEN;
+    if (history_count < FREQ_HISTORY_LEN) {
+        history_count++;
+        return false;
+    }
+
+    // // 3) If we don't have enough windows yet, we can't make a strong statement
+    // if (history_count < FREQ_HISTORY_LEN) {
+    //        // "not yet sure"
+    // }
+
+    // 4) Count how many recent windows were in-band
+    size_t in_band_count = 0;
+    for (size_t i = 0; i < history_count; i++) {
+        if (in_band_history[i]) {
+            in_band_count++;
+        }
+    }
+
+    // 5) Persistent oscillation = enough windows in-band
+    return (in_band_count >= MIN_WINDOWS_IN_BAND);
+}
 
 
 
@@ -225,7 +255,7 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
 int16_t* magnitude(int16_t* v1, int16_t* v2, int16_t* v3) {
     int16_t mag_buffer[BUFFER_SIZE];
     for(int16_t i = 0  ; i < BUFFER_SIZE ; i++) {
-        printf("x: v1[i] = %d, v2[i] = %d, v3[i] = %d\n", v1[i], v2[i], v3[i]);
+        //printf("x: v1[i] = %d, v2[i] = %d, v3[i] = %d\n", v1[i], v2[i], v3[i]);
         mag_buffer[i] = sqrtf(
             v1[i]*v1[i] +
             v2[i]*v2[i] +
@@ -331,22 +361,22 @@ int16_t* magnitude(int16_t* v1, int16_t* v2, int16_t* v3) {
             // bool in_x = (fx >= DYSK_MIN_FREQ && fx <= DYSK_MAX_FREQ);
             // bool in_y = (fy >= DYSK_MIN_FREQ && fy <= DYSK_MAX_FREQ);
             // bool in_z = (fz >= DYSK_MIN_FREQ && fz <= DYSK_MAX_FREQ);
-            bool bool_dys = (freq_magnitude >= DYSK_MIN_FREQ && freq_magnitude <= DYSK_MAX_FREQ);
+            // bool bool_dys = (freq_magnitude >= DYSK_MIN_FREQ && freq_magnitude <= DYSK_MAX_FREQ);
             // // combined condition: all three axes in band for this window
             // bool combined_in_band = in_x || in_y || in_z;
-            bool combined_in_band = bool_dys;
+            // bool combined_in_band = bool_dys;
             
             
 
-            float avg_f = 0.0f;
-            size_t count_nonzero = 0;
-            // if (fx > 0.0f) { avg_f += fx; count_nonzero++; }
-            // if (fy > 0.0f) { avg_f += fy; count_nonzero++; }
-            // if (fz > 0.0f) { avg_f += fz; count_nonzero++; }
-            if (freq_magnitude > 0.0f) { avg_f += freq_magnitude; count_nonzero++; }
-            if (count_nonzero > 0) avg_f /= count_nonzero;
+            // float avg_f = 0.0f;
+            // size_t count_nonzero = 0;
+            // // if (fx > 0.0f) { avg_f += fx; count_nonzero++; }
+            // // if (fy > 0.0f) { avg_f += fy; count_nonzero++; }
+            // // if (fz > 0.0f) { avg_f += fz; count_nonzero++; }
+            // if (freq_magnitude > 0.0f) { avg_f += freq_magnitude; count_nonzero++; }
+            // if (count_nonzero > 0) avg_f /= count_nonzero;
 
-            bool persistent_dys = update_and_check_persistent_dysk(combined_in_band, avg_f);
+            bool persistent_dys = update_and_check_persistent_dysk(fz);
             printf("\nDyskinesia check:\n");
             
             // printf("Window freqs: X=%.2fHz Y=%.2fHz Z=%.2fHz | in_band: X=%c Y=%c Z=%c | persistent dyskinesia=%s\r\n",
@@ -354,7 +384,7 @@ int16_t* magnitude(int16_t* v1, int16_t* v2, int16_t* v3) {
             //        in_x ? 'Y' : 'N', in_y ? 'Y' : 'N', in_z ? 'Y' : 'N',
             //        persistent_dys ? "YES" : "NO");
             printf("Window mag freq: %.2fHz |  persistent dyskinesia=%s\r\n",
-                   freq_magnitude,
+                   fz,
 
                    persistent_dys ? "YES" : "NO");
 
