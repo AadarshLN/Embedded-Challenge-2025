@@ -200,6 +200,7 @@ bool update_and_check_fog(float freq_hz)
         }
         // movement breaks the "still" streak
         recent_still_windows = 0;
+        printf("MOVING WINDOW DETECTED\n");
     }
     else if (still) {
         // We’re clearly still; only counts toward FOG if we had movement before.
@@ -207,6 +208,7 @@ bool update_and_check_fog(float freq_hz)
             recent_still_windows < FOG_STILL_WINDOWS) {
             recent_still_windows++;
         }
+        printf("STILL WINDOW DETECTED\n");
     }
     else {
         // In-between frequency: neither clearly moving nor still.
@@ -216,12 +218,13 @@ bool update_and_check_fog(float freq_hz)
     bool fog_detected =
         (recent_move_windows >= FOG_PREV_MOVE_WINDOWS) &&
         (recent_still_windows >= FOG_STILL_WINDOWS);
-
+    printf("Fog detected : %d\n", fog_detected);
     if (fog_detected) {
         // Reset so you can detect another FOG event later.
         recent_move_windows  = 0;
         recent_still_windows = 0;
     }
+    
 
     return fog_detected;
 }
