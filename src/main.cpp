@@ -31,12 +31,12 @@ FileHandle *mbed::mbed_override_console(int) {
 #define BUFFER_SIZE 64  // adjust size depending on RAM
 #define FS 20.0f        // sampling frequency (Hz)
 
-#define DYSK_MIN_FREQ 4.5f
-#define DYSK_MAX_FREQ 7.5f
+#define DYSK_MIN_FREQ 5.0f
+#define DYSK_MAX_FREQ 7.0f
 
 // Frequency band we care about
-#define OSC_MIN_FREQ          2.5f
-#define OSC_MAX_FREQ          5.5f
+#define OSC_MIN_FREQ          3.0f
+#define OSC_MAX_FREQ          5.0f
 
 // How many windows to remember and how strict to be
 #define FREQ_HISTORY_LEN      5       // last 5 windows
