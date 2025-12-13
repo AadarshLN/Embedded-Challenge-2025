@@ -199,8 +199,8 @@ public:
             printf("hellohello");
             notification_ticker.attach([]() {
                 event_queue.call(send_TREMOR_notification);
-                event_queue.call(send_DYSKINESIA_notification);
-                event_queue.call(send_FOG_notification);
+                event_queue.call_in(300ms,send_DYSKINESIA_notification);
+                event_queue.call_in(600ms,send_FOG_notification);
             }, 1s);
         }
     }
