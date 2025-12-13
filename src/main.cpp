@@ -58,6 +58,222 @@ bool  dysk_in_band_history[FREQ_HISTORY_LEN];
 size_t dysk_history_idx    = 0;
 size_t dysk_history_count  = 0;
 
+#include "mbed.h"
+#include "ble/BLE.h"
+#include "ble/gatt/GattService.h"
+#include "ble/gatt/GattCharacteristic.h"
+#include "ble/Gap.h"
+#include "ble/gap/AdvertisingDataBuilder.h"
+#include "events/EventQueue.h"
+#include <chrono>
+#include <string.h>
+
+// BufferedSerial serial_port(USBTX, USBRX, 115200);
+// FileHandle *mbed::mbed_override_console(int) { return &serial_port; }
+
+using namespace ble;
+using namespace events;
+using namespace std::chrono;
+
+BLE &ble_interface = BLE::Instance();
+EventQueue event_queue;
+DigitalOut led(LED1);
+
+const UUID TREMOR_SERVICE_UUID("A0E1B2C3-D4E5-F6A7-B8C9-D0E1F2A3B4C5");
+const UUID TREMOR_TYPE_CHAR_UUID("A1E2B3C4-D5E6-F7A8-B9C0-D1E2F3A4B5C6");
+
+const char* TREMOR_STRING     = "TREMOR";
+const char* DYSKINESIA_STRING = "DYSKINESIA";
+const char* FOG_STRING       = "FOG";
+
+bool persistent_tremor = false;
+bool persistent_dys = false;
+bool fog_detected = false;
+
+// ======================= CHANGED (1): buffer size + NO null terminator =======================
+// BLE values are just bytes; to "broadcast ASCII", send only the ASCII bytes (no '\0').
+// Longest string here is "DYSKINESIA" = 9 bytes.
+#define MAX_TREMOR_STRING_LEN  9
+
+uint8_t TREMORValue[MAX_TREMOR_STRING_LEN] = {0};
+// ============================================================================================
+
+
+// ======================= CHANGED (2): use variable-length GattCharacteristic =======================
+// Your previous ReadOnlyArrayGattCharacteristic has a fixed-length view; switching to a
+// variable-length characteristic avoids trailing garbage when strings have different lengths.
+GattCharacteristic TREMORTypeCharacteristic(
+    TREMOR_TYPE_CHAR_UUID,
+    TREMORValue,
+    0,                         // initial length (we'll write real length later)
+    MAX_TREMOR_STRING_LEN,     // max length
+    GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ |
+    GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY
+);
+// ================================================================================================
+
+GattCharacteristic *charTable[] = { &TREMORTypeCharacteristic };
+GattService TREMOR_Service(TREMOR_SERVICE_UUID, charTable, 1);
+
+bool isTremor = true;
+Ticker notification_ticker;
+bool device_connected = false;
+
+// ======================= CHANGED (3): write ASCII bytes only (no null) =======================
+static void set_ascii_value(const char* s) {
+    size_t n = strlen(s);
+    if (n > MAX_TREMOR_STRING_LEN) n = MAX_TREMOR_STRING_LEN;
+
+    memset(TREMORValue, 0, sizeof(TREMORValue));          // clear old bytes
+    memcpy(TREMORValue, s, n);                            // copy ASCII bytes
+
+    ble_interface.gattServer().write(
+        TREMORTypeCharacteristic.getValueHandle(),
+        TREMORValue,
+        n                                                // <-- NO +1, no null terminator
+    );
+}
+// ============================================================================================
+
+void send_TREMOR_notification() {
+    if (!device_connected) {
+        printf("No device connected, skipping notification\n");
+        return;
+    }
+
+   // const char* msg = isTremor ? TREMOR_STRING : DYSKINESIA_STRING;
+   const char* msg = persistent_tremor ? TREMOR_STRING : "Not tremor" ;
+   
+   // CHANGED: use persistent tremor flag
+    set_ascii_value(msg);                                 // CHANGED: uses helper above
+
+    printf("Sent notification (ASCII): %s\n", msg);
+
+    led = !led;
+    //isTremor = !isTremor;
+}
+
+void send_DYSKINESIA_notification() {
+    if (!device_connected) {
+        printf("No device connected, skipping notification\n");
+        return;
+    }
+
+   // const char* msg = isTremor ? TREMOR_STRING : DYSKINESIA_STRING;
+   const char* msg = persistent_dys ? DYSKINESIA_STRING : "Not dyskinesia" ;
+   
+   // CHANGED: use persistent tremor flag
+    set_ascii_value(msg);                                 // CHANGED: uses helper above
+
+    printf("Sent notification (ASCII): %s\n", msg);
+
+    led = !led;
+    //isTremor = !isTremor;
+}
+
+void send_FOG_notification() {
+    if (!device_connected) {
+        printf("No device connected, skipping notification\n");
+        return;
+    }
+
+   // const char* msg = isTremor ? TREMOR_STRING : DYSKINESIA_STRING;
+   const char* msg = fog_detected ? FOG_STRING : "Not fog" ;
+   // CHANGED: use persistent tremor flag
+    set_ascii_value(msg);                                 // CHANGED: uses helper above
+    printf("Sent notification (ASCII): %s\n", msg);
+
+    led = !led;
+    //isTremor = !isTremor;
+}
+
+
+class ConnectionEventHandler : public ble::Gap::EventHandler {
+public:
+    virtual void onConnectionComplete(const ble::ConnectionCompleteEvent &event) {
+        if (event.getStatus() == BLE_ERROR_NONE) {
+            printf("Device connected!\n");
+            device_connected = true;
+
+            set_ascii_value(TREMOR_STRING);               // CHANGED: initialize with ASCII
+            printf("hellohello");
+            notification_ticker.attach([]() {
+                event_queue.call(send_TREMOR_notification);
+                event_queue.call(send_DYSKINESIA_notification);
+                event_queue.call(send_FOG_notification);
+            }, 1s);
+        }
+    }
+
+    virtual void onDisconnectionComplete(const ble::DisconnectionCompleteEvent &event) {
+        printf("Device disconnected!\n");
+        device_connected = false;
+        notification_ticker.detach();
+
+        ble_interface.gap().startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
+        printf("Restarted advertising\n");
+    }
+};
+
+ConnectionEventHandler connection_handler;
+
+void on_ble_init_complete(BLE::InitializationCompleteCallbackContext *params) {
+    if (params->error != BLE_ERROR_NONE) {
+        printf("BLE initialization failed.\n");
+        return;
+    }
+
+    // CHANGED: initialize characteristic with ASCII bytes (no '\0')
+    set_ascii_value(TREMOR_STRING);
+
+    ble_interface.gattServer().addService(TREMOR_Service);
+
+    uint8_t adv_buffer[LEGACY_ADVERTISING_MAX_SIZE];
+    AdvertisingDataBuilder adv_data(adv_buffer);
+
+    adv_data.setFlags();
+    adv_data.setName("TREMOR--Monitor");
+
+    ble_interface.gap().setAdvertisingParameters(
+        LEGACY_ADVERTISING_HANDLE,
+        AdvertisingParameters(advertising_type_t::CONNECTABLE_UNDIRECTED, adv_interval_t(160))
+    );
+
+    ble_interface.gap().setAdvertisingPayload(
+        LEGACY_ADVERTISING_HANDLE,
+        adv_data.getAdvertisingData()
+    );
+
+    ble_interface.gap().setEventHandler(&connection_handler);
+    ble_interface.gap().startAdvertising(LEGACY_ADVERTISING_HANDLE);
+
+    printf("BLE advertising started as TREMOR--Monitor\n");
+    printf("Waiting for device connection...\n");
+}
+
+void schedule_ble_events(BLE::OnEventsToProcessCallbackContext *context) {
+    event_queue.call(callback(&ble_interface, &BLE::processEvents));
+}
+
+
+//bluetooth end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
  // Write a value to a register
  void write_register(uint8_t reg, uint8_t value) {
@@ -286,6 +502,12 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
      DigitalOut detect_led(LED1);   // LED shows persistent detection
  
      
+    ble_interface.onEventsToProcess(schedule_ble_events);
+    ble_interface.init(on_ble_init_complete);
+
+    Thread ble_thread;
+    ble_thread.start(callback(&event_queue, &EventQueue::dispatch_forever));
+
      // Main loop
      while (1) {
 
@@ -301,7 +523,7 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
 
          if(idx >= BUFFER_SIZE) {
              float fz = estimate_frequency(acc_z_buffer, BUFFER_SIZE);
-            bool persistent_dys = update_and_check_persistent_dysk(fz);
+            persistent_dys = update_and_check_persistent_dysk(fz);
             printf("\nDyskinesia check:\n");
             printf("Window mag freq: %.2fHz |  persistent dyskinesia=%s\r\n",
                    fz,
@@ -310,7 +532,7 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
 
             idx = 0; // reset buffer
             // 2) Update history & check persistence
-            bool persistent_tremor = update_and_check_persistent_oscillation(fz);
+            persistent_tremor = update_and_check_persistent_oscillation(fz);
             // 3) Print what’s going on
             printf("\n\nTremor check:\n");
             printf("Window freq: %.2f Hz | persistent(2.5-5.5Hz) = %s\r\n",
@@ -319,7 +541,7 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
             idx = 0;
 
 
-            bool fog_detected = update_and_check_fog(fz);
+            fog_detected = update_and_check_fog(fz);
             printf("FOG Detection check:\n");
             printf("\nWindow freq: %.2f Hz | Dyskinesia=%s | Tremor=%s | FOG=%s\r\n",
        fz,
@@ -330,6 +552,14 @@ float estimate_frequency(int16_t *raw_buffer, size_t N) {
         }
        // Wait before next sample
          ThisThread::sleep_for(50ms);
+    
+        // printf("Starting BLE TREMOR Monitor...\n");
+
+
+    //event_queue.dispatch_forever();
+    
+
      }
+    
  }
  
